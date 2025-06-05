@@ -3,3 +3,4 @@ aiohttp
 feedparser
 python-dotenv
 flask
+apscheduler
