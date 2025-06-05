@@ -1,110 +1,84 @@
 import os
 import asyncio
 import feedparser
-from aiogram import Bot
-from dotenv import load_dotenv
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+import aiohttp
 from datetime import datetime
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from dotenv import load_dotenv
 import pytz
 
-# Загрузка токена и канала
+# Загружаем переменные из .env
 load_dotenv()
-API_TOKEN = os.getenv("API_TOKEN")
-CHANNEL = os.getenv("CHANNEL")
+TELEGRAM_TOKEN = os.getenv("API_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("CHANNEL")
 
-bot = Bot(token=API_TOKEN)
+# Московское время
+moscow_tz = pytz.timezone("Europe/Moscow")
 
-# Список RSS-лент
-RSS_FEEDS = [
-    "https://ria.ru/export/rss2/archive/index.xml",
-    "https://tass.ru/rss/v2.xml",
-]
+# RSS-источник
+RSS_URL = "https://lenta.ru/rss"
 
-# Файл с уже отправленными ссылками
-SENT_FILE = "sent.txt"
-if not os.path.exists(SENT_FILE):
-    open(SENT_FILE, "w").close()
+# Запоминаем, что уже отправляли
+sent_titles = set()
 
-with open(SENT_FILE, "r", encoding="utf-8") as f:
-    sent_links = set(f.read().splitlines())
+# Ключевые слова для фильтрации
+IMPORTANT_KEYWORDS = ["погиб", "взрыв", "катастроф", "теракт", "убит", "произошло", "срочно", "чрезвычайн", "авария", "загорел", "стрельб", "обстрел"]
 
-# Фильтр для важных новостей
-IMPORTANT_KEYWORDS = ["срочно", "важно", "экстренно", "немедленно", "молния"]
-
-# Проверка на важность
-def is_important(title):
+def is_important(title: str) -> bool:
+    """Проверка, содержит ли заголовок важные ключевые слова."""
     lower_title = title.lower()
     return any(keyword in lower_title for keyword in IMPORTANT_KEYWORDS)
 
-# Получение новых новостей
-async def get_new_posts():
-    new_posts = []
-    for feed_url in RSS_FEEDS:
-        feed = feedparser.parse(feed_url)
+async def send_telegram_message(session: aiohttp.ClientSession, text: str):
+    """Отправка сообщения в Telegram."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML"
+    }
+
+    async with session.post(url, data=payload) as response:
+        if response.status != 200:
+            error = await response.text()
+            print(f"❌ Ошибка отправки: {error}")
+
+async def check_news(scheduled=False):
+    """Проверка RSS и отправка важных новостей."""
+    print(f"\n[{datetime.now(moscow_tz):%Y-%m-%d %H:%M:%S}] 🔍 Проверка новостей (scheduled={scheduled}) — UTC: {datetime.utcnow()}")
+
+    feed = feedparser.parse(RSS_URL)
+    async with aiohttp.ClientSession() as session:
         for entry in feed.entries:
-            link = entry.link
             title = entry.title
-            if link not in sent_links:
-                message = f"{title}\n{link}"
-                new_posts.append((link, title, message))
-                sent_links.add(link)
-    return new_posts
+            link = entry.link
 
-# Отправка новостей
-async def send_news(scheduled=False):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔍 Проверка новостей (scheduled={scheduled})")
-    posts = await get_new_posts()
-    if not posts:
-        print("Нет новых новостей.")
-        return
+            if title not in sent_titles and is_important(title):
+                print(f"📢 Отправляем важную новость: {title}")
+                sent_titles.add(title)
+                await send_telegram_message(session, f"<b>{title}</b>\n{link}")
 
-    for link, title, message in posts:
-        try:
-            if scheduled or not is_important(title):
-                # Отправка по расписанию
-                await bot.send_message(CHANNEL, message)
-                print(f"📤 Отправлено: {title}")
-                await asyncio.sleep(2)
-            else:
-                # Немедленная отправка важных
-                print(f"⚡ Важная новость — отправляем сразу: {title}")
-                await bot.send_message(CHANNEL, message)
-                await asyncio.sleep(2)
-        except Exception as e:
-            print(f"⚠️ Ошибка при отправке: {e}")
+    if not any(is_important(entry.title) and entry.title not in sent_titles for entry in feed.entries):
+        print("🚫 Нет важных новостей.")
 
-    # Сохраняем ссылки
-    with open(SENT_FILE, "w", encoding="utf-8") as f:
-        f.write("\n".join(sent_links))
-
-# Настройка расписания
 def setup_scheduler():
-    scheduler = AsyncIOScheduler(timezone=pytz.timezone("Europe/Moscow"))
+    """Настройка расписания."""
+    scheduler = AsyncIOScheduler(timezone=moscow_tz)
 
-    # Каждые 10 минут — только важные (внутри send_news решается)
-    scheduler.add_job(send_news, "interval", minutes=10, kwargs={"scheduled": False})
-
-    # Расписание для обычных новостей
-    scheduler.add_job(send_news, CronTrigger(hour=8, minute=0), kwargs={"scheduled": True})   # Утро
-    scheduler.add_job(send_news, CronTrigger(hour=13, minute=0), kwargs={"scheduled": True})  # День
-    scheduler.add_job(send_news, CronTrigger(hour=18, minute=0), kwargs={"scheduled": True})  # Вечер
-    scheduler.add_job(send_news, CronTrigger(hour=23, minute=0), kwargs={"scheduled": True})  # Ночь
+    scheduler.add_job(check_news, 'cron', hour=8, minute=0, kwargs={'scheduled': True})   # Утро
+    scheduler.add_job(check_news, 'cron', hour=13, minute=0, kwargs={'scheduled': True})  # День
+    scheduler.add_job(check_news, 'cron', hour=18, minute=0, kwargs={'scheduled': True})  # Вечер
+    scheduler.add_job(check_news, 'cron', hour=23, minute=0, kwargs={'scheduled': True})  # Ночь
 
     scheduler.start()
-    print("📆 Планировщик запущен.")
 
-# Главная функция
 async def main():
     print("🤖 Бот запущен и слушает RSS...")
-
-    # Сразу проверим важные при запуске
-    await send_news(scheduled=False)
-
+    await check_news()
     setup_scheduler()
 
     while True:
-        await asyncio.sleep(1)
+        await asyncio.sleep(60)  # Чтобы процесс не завершался
 
 if __name__ == "__main__":
     asyncio.run(main())
